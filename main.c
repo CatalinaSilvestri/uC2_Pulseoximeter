@@ -1,105 +1,178 @@
-
-
-
+#define F_CPU 4000000UL
 
 #include <xc.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <util/delay.h>
 #include <stdio.h>
+#include <avr/interrupt.h>
 
 #include "mcc_generated_files/system/system.h"
-#include "mcc_generated_files/i2c_host/twi0.h"
+#include "mcc_generated_files/timer/tca0.h"
+
 #include "lcd.h"
 #include "LcdUtils.h"
 #include "MAX30100.h"
-#define MAX30100_ADDR 0x57
 
-void logToDataStream(uint8_t* raw)
-{
-    USART2_Write(0x03);
-    for(uint8_t i=0; i<4; i++)
-    {
-        USART2_Write(raw[i]);
-    }
-    USART2_Write(0xfc);
-}
+int32_t ir_avg = 0;
+int16_t ir_ac = 0;
+int16_t ir_smooth = 0;
+
+int16_t prev = 0;
+
+uint16_t sample_counter = 0;
+uint16_t last_beat_sample = 0;
+uint16_t distance = 0;
+
+uint16_t bpm = 0;
+uint16_t bpm_new = 0;
+
+uint8_t finger_detected = 0;
+uint8_t beat_detected = 0;
+
+uint16_t lcd_counter = 0;
+
+#define THRESHOLD       100
+#define MIN_DISTANCE    55
+#define MAX_DISTANCE    130
 int main(void)
 {
     SYSTEM_Initialize();
     LCD_Initialize();
 
-    uint8_t d[2];
-    uint8_t reg;
-    uint8_t raw[4];
-    uint16_t ir;
-    uint16_t ir_avg = 0;
-    uint16_t red;
-    int16_t ir_peak = 0;
-    int16_t ir_smooth = 0;
-
+    MAX30100_Sample_t sample;
     char line[17];
 
     _delay_ms(500);
 
-    // LED current max
-    d[0] = 0x09;
-    d[1] = 0xFF;
-    TWI0_Write(MAX30100_ADDR, d, 2);
-    while (TWI0_IsBusy());
+    MAX30100_Init();
+while (1)
+{
+    beat_detected = 0;
 
-    // SpO2 Mode starten
-    d[0] = 0x06;
-    d[1] = 0x03;
-    TWI0_Write(MAX30100_ADDR, d, 2);
-    while (TWI0_IsBusy());
-    
-   
-
-    while (1)
+    if (MAX30100_ReadFIFO(&sample))
     {
-        // FIFO Data Register auswÃ¤hlen und 4 Bytes lesen
-        reg = 0x05;
+        sample_counter++;
+        lcd_counter++;
 
-        TWI0_WriteRead(MAX30100_ADDR, &reg, 1, raw, 4);
-        while (TWI0_IsBusy());
-
-        ir  = ((uint16_t)raw[0] << 8) | raw[1];
-
-        red = ((uint16_t)raw[2] << 8) | raw[3];
-
-        if(ir < 10000 || red < 10000)
-
+        if (sample.ir < 10000 || sample.red < 10000)
         {
-            
-            ir = 0;
+            finger_detected = 0;
 
-            red = 0;
+            ir_avg = 0;
+            ir_ac = 0;
+            ir_smooth = 0;
+            prev = 0;
 
+            sample_counter = 0;
+            last_beat_sample = 0;
+            distance = 0;
+
+            bpm = 0;
+            bpm_new = 0;
+        }
+        else
+        {
+            finger_detected = 1;
+
+            if (ir_avg == 0)
+            {
+                ir_avg = sample.ir;
+            }
+
+            // DC-Anteil entfernen
+            ir_avg = ir_avg + (((int32_t)sample.ir - ir_avg) / 32);
+
+            // AC-Signal bilden
+            ir_ac = (int16_t)((int32_t)sample.ir - ir_avg);
+
+            // Signal glätten
+            ir_smooth = ir_smooth + ((ir_ac - ir_smooth) / 4);
+
+            /*
+             * Einfache Beat-Erkennung:
+             * Wir erkennen den Beat, wenn das Signal von unterhalb der Schwelle
+             * nach oberhalb der Schwelle steigt.
+             */
+            if ((prev < THRESHOLD) && (ir_smooth >= THRESHOLD))
+            {
+                if (last_beat_sample == 0)
+                {
+                    last_beat_sample = sample_counter;
+                    beat_detected = 1;
+                }
+                else
+                {
+                    distance = sample_counter - last_beat_sample;
+
+                    if (distance > MIN_DISTANCE && distance < MAX_DISTANCE)
+                    {
+                        bpm_new = (uint16_t)(6000UL / distance);
+
+                        if (bpm == 0)
+                        {
+                            bpm = bpm_new;
+                        }
+                        else
+                        {
+                            // BPM langsam glätten
+                            bpm = bpm + ((int16_t)bpm_new - (int16_t)bpm) / 4;
+                        }
+
+                        last_beat_sample = sample_counter;
+                        beat_detected = 1;
+                    }
+                    else if (distance >= MAX_DISTANCE)
+                    {
+                        /*
+                         * Wenn sehr lange kein Beat erkannt wurde:
+                         * neuen Startpunkt setzen, aber BPM nicht berechnen.
+                         */
+                        last_beat_sample = sample_counter;
+                        beat_detected = 1;
+                    }
+                }
+            }
+
+            prev = ir_smooth;
         }
 
-        ir_avg = ir_avg + (ir - ir_avg) / 16;
-
-        ir_peak = (int16_t)ir - (int16_t)ir_avg;
-
-        // Peak-Signal zusÃ¤tzlich glÃ¤tten
-
-        ir_smooth = ir_smooth + (ir_peak - ir_smooth) / 4;
-
-        LCDGoto(0, 0);
-
-        sprintf(line, "IR:%6d       ", ir_smooth);
-
-        LCDPutStr(line);
-
-        LCDGoto(0, 1);
-
-        sprintf(line, "R:%5u         ", red);
-
-        LCDPutStr(line);
-        if (USART2_IsTxReady())
+        /*
+         * LCD nur alle ca. 500 ms aktualisieren.
+         * Bei 100 Hz entspricht 50 Samples ca. 0,5 s.
+         */
+        if (lcd_counter >= 50)
         {
-            logToDataStream(raw);
+            lcd_counter = 0;
+
+            LCDGoto(0, 0);
+
+            if (finger_detected)
+            {
+                sprintf(line, "BPM:%3u D:%3u ", bpm, distance);
+            }
+            else
+            {
+                sprintf(line, "Finger fehlt ");
+            }
+
+            LCDPutStr(line);
+
+            LCDGoto(0, 1);
+
+            if (beat_detected)
+            {
+                sprintf(line, "BEAT AC:%5d ", ir_smooth);
+            }
+            else
+            {
+                sprintf(line, "AC:%7d     ", ir_smooth);
+            }
+
+            LCDPutStr(line);
         }
     }
+
+    _delay_ms(10);
+}
 }
