@@ -1,178 +1,327 @@
-#define F_CPU 4000000UL
-
 #include <xc.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <util/delay.h>
 #include <stdio.h>
-#include <avr/interrupt.h>
 
 #include "mcc_generated_files/system/system.h"
-#include "mcc_generated_files/timer/tca0.h"
-
+#include "mcc_generated_files/i2c_host/twi0.h"
 #include "lcd.h"
 #include "LcdUtils.h"
-#include "MAX30100.h"
 
-int32_t ir_avg = 0;
-int16_t ir_ac = 0;
-int16_t ir_smooth = 0;
+#define MAX30100_ADDR 0x57
 
-int16_t prev = 0;
+#define LOOP_DELAY_MS 10UL
+#define LCD_UPDATE_MS 500UL
 
-uint16_t sample_counter = 0;
-uint16_t last_beat_sample = 0;
-uint16_t distance = 0;
+#define BEAT_INIT_HOLDOFF_MS      2000UL
+#define BEAT_MASKING_HOLDOFF_MS   400UL
+#define BEAT_INVALID_DELAY_MS     2000UL
 
-uint16_t bpm = 0;
-uint16_t bpm_new = 0;
+#define BEAT_MIN_THRESHOLD        20
+#define BEAT_MAX_THRESHOLD        800
+#define BEAT_STEP_RESILIENCY      30
 
-uint8_t finger_detected = 0;
-uint8_t beat_detected = 0;
+#define BEAT_PERIOD_ALPHA_NUM     6
+#define BEAT_PERIOD_ALPHA_DEN     10
 
-uint16_t lcd_counter = 0;
+typedef enum {
+    BEAT_INIT,
+    BEAT_WAITING,
+    BEAT_FOLLOWING_SLOPE,
+    BEAT_MAYBE_DETECTED,
+    BEAT_MASKING
+} BeatState;
 
-#define THRESHOLD       100
-#define MIN_DISTANCE    55
-#define MAX_DISTANCE    130
+static BeatState beatState = BEAT_INIT;
+
+static int16_t threshold = BEAT_MIN_THRESHOLD;
+static int16_t lastMaxValue = 0;
+static uint32_t lastBeatMs = 0;
+static uint32_t beatPeriod = 0;
+static uint16_t bpm = 0;
+
+static int32_t dcw = 0;
+static int16_t lpf_prev = 0;
+
+#define LOOP_DELAY_MS 8UL
+#define LCD_UPDATE_MS 1000UL
+
+#define BEAT_INIT_HOLDOFF_MS      2000UL
+#define BEAT_INVALID_DELAY_MS     2500UL
+
+#define MIN_VALID_BEAT_MS         500UL
+#define MAX_VALID_BEAT_MS         1500UL
+
+#define BEAT_MIN_THRESHOLD        40
+#define BEAT_MAX_THRESHOLD        800
+#define BEAT_STEP_RESILIENCY      100
+
+void logToDataStream(uint8_t* raw)
+{
+    USART2_Write(0x03);
+    for (uint8_t i = 0; i < 4; i++)
+    {
+        USART2_Write(raw[i]);
+    }
+    USART2_Write(0xfc);
+}
+
+static void BeatDetector_Reset(void)
+{
+    beatState = BEAT_INIT;
+    threshold = BEAT_MIN_THRESHOLD;
+    lastMaxValue = 0;
+    lastBeatMs = 0;
+    beatPeriod = 0;
+    bpm = 0;
+    dcw = 0;
+    lpf_prev = 0;
+}
+
+static int16_t DCRemove(uint16_t raw)
+{
+    int32_t old = dcw;
+
+    // Approximation of alpha = 0.95 from the Arduino source
+    dcw = (int32_t)raw + ((dcw * 95L) / 100L);
+
+    return (int16_t)(dcw - old);
+}
+
+static int16_t LowPass(int16_t x)
+{
+    lpf_prev = lpf_prev + ((x - lpf_prev) / 4);
+    return lpf_prev;
+}
+
+static void decreaseThreshold(void)
+{
+    if (lastMaxValue > 0 && beatPeriod > 0)
+    {
+        uint32_t div = beatPeriod / 10UL;
+        if (div == 0)
+        {
+            div = 1;
+        }
+
+        threshold -= (int16_t)(((int32_t)lastMaxValue * 7L) / (int32_t)div);
+    }
+    else
+    {
+        threshold = (threshold * 99) / 100;
+    }
+
+    if (threshold < BEAT_MIN_THRESHOLD)
+    {
+        threshold = BEAT_MIN_THRESHOLD;
+    }
+}
+
+static bool BeatDetector_Update(int16_t sample, uint32_t nowMs)
+{
+    bool beatDetected = false;
+
+    switch (beatState)
+    {
+        case BEAT_INIT:
+            if (nowMs > BEAT_INIT_HOLDOFF_MS)
+            {
+                beatState = BEAT_WAITING;
+            }
+            break;
+
+        case BEAT_WAITING:
+            if (sample > threshold)
+            {
+                threshold = sample;
+
+                if (threshold > BEAT_MAX_THRESHOLD)
+                {
+                    threshold = BEAT_MAX_THRESHOLD;
+                }
+
+                beatState = BEAT_FOLLOWING_SLOPE;
+            }
+
+            if ((nowMs - lastBeatMs) > BEAT_INVALID_DELAY_MS)
+            {
+                beatPeriod = 0;
+                lastMaxValue = 0;
+                bpm = 0;
+            }
+
+            decreaseThreshold();
+            break;
+
+        case BEAT_FOLLOWING_SLOPE:
+            if (sample < threshold)
+            {
+                beatState = BEAT_MAYBE_DETECTED;
+            }
+            else
+            {
+                threshold = sample;
+
+                if (threshold > BEAT_MAX_THRESHOLD)
+                {
+                    threshold = BEAT_MAX_THRESHOLD;
+                }
+            }
+            break;
+
+        case BEAT_MAYBE_DETECTED:
+            if ((sample + BEAT_STEP_RESILIENCY) < threshold)
+            {
+                uint32_t delta = nowMs - lastBeatMs;
+
+                beatDetected = true;
+                lastMaxValue = threshold;
+                beatState = BEAT_MASKING;
+
+                if (delta >= MIN_VALID_BEAT_MS && delta <= MAX_VALID_BEAT_MS)
+                {
+                    if (beatPeriod == 0)
+                    {
+                        beatPeriod = delta;
+                    }
+                    else
+                    {
+                        beatPeriod =
+                            ((BEAT_PERIOD_ALPHA_NUM * delta) +
+                             ((BEAT_PERIOD_ALPHA_DEN - BEAT_PERIOD_ALPHA_NUM) * beatPeriod))
+                            / BEAT_PERIOD_ALPHA_DEN;
+                    }
+
+                    uint16_t newBpm = (uint16_t)(60000UL / beatPeriod);
+
+                    if (bpm == 0)
+                    {
+                        bpm = newBpm;
+                    }
+                    else
+                    {
+                        bpm = (bpm * 7 + newBpm) / 8;
+                    }
+                                }
+
+                lastBeatMs = nowMs;
+            }
+            else
+            {
+                beatState = BEAT_FOLLOWING_SLOPE;
+            }
+            break;
+
+        case BEAT_MASKING:
+            if ((nowMs - lastBeatMs) > BEAT_MASKING_HOLDOFF_MS)
+            {
+                beatState = BEAT_WAITING;
+            }
+
+            decreaseThreshold();
+            break;
+    }
+
+    return beatDetected;
+}
+
 int main(void)
 {
     SYSTEM_Initialize();
     LCD_Initialize();
 
-    MAX30100_Sample_t sample;
+    uint8_t d[2];
+    uint8_t reg;
+    uint8_t raw[4];
+
+    uint16_t ir;
+    uint16_t red;
+
+    int16_t irAC;
+    int16_t filteredPulse;
+
+    uint32_t timeMs = 0;
+    uint32_t lastLcdMs = 0;
+
     char line[17];
 
     _delay_ms(500);
 
-    MAX30100_Init();
-while (1)
-{
-    beat_detected = 0;
+    d[0] = 0x09;
+    d[1] = 0xFF;
+    TWI0_Write(MAX30100_ADDR, d, 2);
+    while (TWI0_IsBusy());
 
-    if (MAX30100_ReadFIFO(&sample))
+    d[0] = 0x06;
+    d[1] = 0x03;
+    TWI0_Write(MAX30100_ADDR, d, 2);
+    while (TWI0_IsBusy());
+
+    LCDGoto(0, 0);
+    LCDPutStr("Place finger    ");
+    LCDGoto(0, 1);
+    LCDPutStr("BPM: --         ");
+
+    while (1)
     {
-        sample_counter++;
-        lcd_counter++;
+        reg = 0x05;
 
-        if (sample.ir < 10000 || sample.red < 10000)
+        TWI0_WriteRead(MAX30100_ADDR, &reg, 1, raw, 4);
+        while (TWI0_IsBusy());
+
+        ir  = ((uint16_t)raw[0] << 8) | raw[1];
+        red = ((uint16_t)raw[2] << 8) | raw[3];
+
+        if (ir < 10000 || red < 10000)
         {
-            finger_detected = 0;
+            BeatDetector_Reset();
 
-            ir_avg = 0;
-            ir_ac = 0;
-            ir_smooth = 0;
-            prev = 0;
+            if ((timeMs - lastLcdMs) >= LCD_UPDATE_MS)
+            {
+                lastLcdMs = timeMs;
 
-            sample_counter = 0;
-            last_beat_sample = 0;
-            distance = 0;
-
-            bpm = 0;
-            bpm_new = 0;
+                LCDGoto(0, 0);
+                LCDPutStr("No finger       ");
+                LCDGoto(0, 1);
+                LCDPutStr("BPM: --         ");
+            }
         }
         else
         {
-            finger_detected = 1;
+            irAC = DCRemove(ir);
 
-            if (ir_avg == 0)
+            // Arduino source mirrors the IR AC signal before beat detection
+            filteredPulse = LowPass(-irAC);
+
+            BeatDetector_Update(filteredPulse, timeMs);
+
+            if ((timeMs - lastLcdMs) >= LCD_UPDATE_MS)
             {
-                ir_avg = sample.ir;
-            }
+                lastLcdMs = timeMs;
 
-            // DC-Anteil entfernen
-            ir_avg = ir_avg + (((int32_t)sample.ir - ir_avg) / 32);
+                LCDGoto(0, 0);
+                LCDPutStr("Finger detected ");
 
-            // AC-Signal bilden
-            ir_ac = (int16_t)((int32_t)sample.ir - ir_avg);
-
-            // Signal glätten
-            ir_smooth = ir_smooth + ((ir_ac - ir_smooth) / 4);
-
-            /*
-             * Einfache Beat-Erkennung:
-             * Wir erkennen den Beat, wenn das Signal von unterhalb der Schwelle
-             * nach oberhalb der Schwelle steigt.
-             */
-            if ((prev < THRESHOLD) && (ir_smooth >= THRESHOLD))
-            {
-                if (last_beat_sample == 0)
+                LCDGoto(0, 1);
+                if (bpm == 0)
                 {
-                    last_beat_sample = sample_counter;
-                    beat_detected = 1;
+                    LCDPutStr("BPM: --         ");
                 }
                 else
                 {
-                    distance = sample_counter - last_beat_sample;
-
-                    if (distance > MIN_DISTANCE && distance < MAX_DISTANCE)
-                    {
-                        bpm_new = (uint16_t)(6000UL / distance);
-
-                        if (bpm == 0)
-                        {
-                            bpm = bpm_new;
-                        }
-                        else
-                        {
-                            // BPM langsam glätten
-                            bpm = bpm + ((int16_t)bpm_new - (int16_t)bpm) / 4;
-                        }
-
-                        last_beat_sample = sample_counter;
-                        beat_detected = 1;
-                    }
-                    else if (distance >= MAX_DISTANCE)
-                    {
-                        /*
-                         * Wenn sehr lange kein Beat erkannt wurde:
-                         * neuen Startpunkt setzen, aber BPM nicht berechnen.
-                         */
-                        last_beat_sample = sample_counter;
-                        beat_detected = 1;
-                    }
+                    sprintf(line, "BPM:%3u         ", bpm);
+                    LCDPutStr(line);
                 }
             }
-
-            prev = ir_smooth;
         }
 
-        /*
-         * LCD nur alle ca. 500 ms aktualisieren.
-         * Bei 100 Hz entspricht 50 Samples ca. 0,5 s.
-         */
-        if (lcd_counter >= 50)
+        if (USART2_IsTxReady())
         {
-            lcd_counter = 0;
-
-            LCDGoto(0, 0);
-
-            if (finger_detected)
-            {
-                sprintf(line, "BPM:%3u D:%3u ", bpm, distance);
-            }
-            else
-            {
-                sprintf(line, "Finger fehlt ");
-            }
-
-            LCDPutStr(line);
-
-            LCDGoto(0, 1);
-
-            if (beat_detected)
-            {
-                sprintf(line, "BEAT AC:%5d ", ir_smooth);
-            }
-            else
-            {
-                sprintf(line, "AC:%7d     ", ir_smooth);
-            }
-
-            LCDPutStr(line);
+            logToDataStream(raw);
         }
-    }
 
-    _delay_ms(10);
-}
+        _delay_ms(LOOP_DELAY_MS);
+        timeMs += LOOP_DELAY_MS;
+    }
 }
