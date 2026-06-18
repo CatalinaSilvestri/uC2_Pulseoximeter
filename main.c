@@ -8,22 +8,90 @@
 #include "mcc_generated_files/i2c_host/twi0.h"
 #include "lcd.h"
 #include "LcdUtils.h"
+#include "beat_detector_c.h"
 
-#define MAX30100_ADDR 0x57
+/*
+ * MAX30100 registers
+ */
+#define MAX30100_ADDR              0x57
 
-#define LOOP_DELAY_MS 10UL
-#define LCD_UPDATE_MS 500UL
+#define REG_FIFO_WR_PTR            0x02
+#define REG_OVF_COUNTER            0x03
+#define REG_FIFO_RD_PTR            0x04
+#define REG_FIFO_DATA              0x05
+#define REG_MODE_CONFIG            0x06
+#define REG_SPO2_CONFIG            0x07
+#define REG_LED_CONFIG             0x09
 
-#define BEAT_INIT_HOLDOFF_MS      2000UL
-#define BEAT_MASKING_HOLDOFF_MS   400UL
-#define BEAT_INVALID_DELAY_MS     2000UL
+#define MODE_SPO2                  0x03
 
-#define BEAT_MIN_THRESHOLD        20
-#define BEAT_MAX_THRESHOLD        800
-#define BEAT_STEP_RESILIENCY      30
+/*
+ * Main timing.
+ * The Arduino MAX30100 library assumes 100 Hz = 10 ms/sample.
+ */
+#define LOOP_DELAY_MS              10UL
+#define LCD_UPDATE_MS              1000UL
 
-#define BEAT_PERIOD_ALPHA_NUM     6
-#define BEAT_PERIOD_ALPHA_DEN     10
+/*
+ * Raw signal limits.
+ */
+#define RAW_MIN_FINGER_LIMIT       10000U
+#define RAW_SATURATION_LIMIT       62000U
+#define FIFO_NEAR_FULL_LIMIT       15U
+
+/*
+ * Beat detector timing.
+ */
+#define BEAT_INIT_HOLDOFF_MS       2000UL
+#define BEAT_MASKING_HOLDOFF_MS    400UL
+#define BEAT_INVALID_DELAY_MS      2500UL
+
+/*
+ * Valid beat interval range.
+ * 500 ms  = 120 BPM
+ * 1500 ms = 40 BPM
+ */
+#define MIN_VALID_BEAT_MS          500UL
+#define MAX_VALID_BEAT_MS          1500UL
+
+/*
+ * Beat detector threshold settings.
+ */
+#define BEAT_MIN_THRESHOLD         40
+#define BEAT_MAX_THRESHOLD         800
+#define BEAT_STEP_RESILIENCY       100
+
+/*
+ * Beat period smoothing:
+ * beatPeriod = 60% new value + 40% old value
+ */
+#define BEAT_PERIOD_ALPHA_NUM      6UL
+#define BEAT_PERIOD_ALPHA_DEN      10UL
+
+/*
+ * Q15 fixed-point format.
+ * 1.0 = 32768
+ */
+#define Q15_SHIFT                  15
+
+/*
+ * Fixed-point coefficients.
+ *
+ * DC remover alpha = 0.95
+ * 0.95 * 32768 = 31130
+ *
+ * Original Arduino MAX30100 low-pass:
+ *
+ * v[0] = v[1];
+ * v[1] = 0.2452372752527856026 * x
+ *      + 0.50952544949442879485 * v[0];
+ * return v[0] + v[1];
+ */
+#define DC_ALPHA_Q15               31130L
+#define LPF_B0_Q15                 8036L
+#define LPF_A1_Q15                 16696L
+
+#define Q15_MUL(a, b) ((int32_t)(((int64_t)(a) * (int64_t)(b)) >> Q15_SHIFT))
 
 typedef enum {
     BEAT_INIT,
@@ -33,6 +101,19 @@ typedef enum {
     BEAT_MASKING
 } BeatState;
 
+typedef struct {
+    int32_t dcw;
+    bool initialized;
+} DCRemoverQ15;
+
+typedef struct {
+    int32_t v0;
+    int32_t v1;
+} LowPassQ15;
+
+/*
+ * Beat detector state.
+ */
 static BeatState beatState = BEAT_INIT;
 
 static int16_t threshold = BEAT_MIN_THRESHOLD;
@@ -41,32 +122,224 @@ static uint32_t lastBeatMs = 0;
 static uint32_t beatPeriod = 0;
 static uint16_t bpm = 0;
 
-static int32_t dcw = 0;
-static int16_t lpf_prev = 0;
+/*
+ * Filter state.
+ */
+static DCRemoverQ15 ir_dc;
+static LowPassQ15 lpf;
 
-#define LOOP_DELAY_MS 8UL
-#define LCD_UPDATE_MS 1000UL
+/*
+ * Last status for LCD.
+ */
+static bool fingerPresent = false;
+static bool saturated = false;
+static bool beatRecentlyDetected = false;
+static uint32_t lastBeatDisplayMs = 0;
 
-#define BEAT_INIT_HOLDOFF_MS      2000UL
-#define BEAT_INVALID_DELAY_MS     2500UL
+/*
+ * State-change tracking.
+ * These prevent resetting the filters/beat detector on every bad sample.
+ */
+static bool lastFingerPresent = false;
+static bool lastSaturated = false;
 
-#define MIN_VALID_BEAT_MS         500UL
-#define MAX_VALID_BEAT_MS         1500UL
-
-#define BEAT_MIN_THRESHOLD        40
-#define BEAT_MAX_THRESHOLD        800
-#define BEAT_STEP_RESILIENCY      100
-
+/*
+ * Optional raw logging.
+ */
 void logToDataStream(uint8_t* raw)
 {
     USART2_Write(0x03);
+
     for (uint8_t i = 0; i < 4; i++)
     {
         USART2_Write(raw[i]);
     }
-    USART2_Write(0xfc);
+
+    USART2_Write(0xFC);
 }
 
+/*
+ * Optional signed 16-bit logging for Data Visualizer.
+ * Configure DV as signed 16-bit, big-endian, frame 0x03 ... 0xFC.
+ */
+static void logInt16ToDataStream(int16_t value)
+{
+    USART2_Write(0x03);
+    USART2_Write((uint8_t)((value >> 8) & 0xFF));
+    USART2_Write((uint8_t)(value & 0xFF));
+    USART2_Write(0xFC);
+}
+
+/*
+ * MAX30100 low-level helpers
+ */
+static bool max30100_write_reg(uint8_t reg, uint8_t value)
+{
+    uint8_t d[2];
+
+    d[0] = reg;
+    d[1] = value;
+
+    if (!TWI0_Write(MAX30100_ADDR, d, 2))
+    {
+        return false;
+    }
+
+    while (TWI0_IsBusy());
+
+    return true;
+}
+
+static bool max30100_read_reg(uint8_t reg, uint8_t *value)
+{
+    if (!TWI0_WriteRead(MAX30100_ADDR, &reg, 1, value, 1))
+    {
+        return false;
+    }
+
+    while (TWI0_IsBusy());
+
+    return true;
+}
+
+static void max30100_reset_fifo(void)
+{
+    max30100_write_reg(REG_FIFO_WR_PTR, 0x00);
+    max30100_write_reg(REG_OVF_COUNTER, 0x00);
+    max30100_write_reg(REG_FIFO_RD_PTR, 0x00);
+}
+
+static uint8_t max30100_get_overflow_count(void)
+{
+    uint8_t ovf = 0;
+
+    if (!max30100_read_reg(REG_OVF_COUNTER, &ovf))
+    {
+        return 0;
+    }
+
+    return ovf & 0x0F;
+}
+
+static uint8_t max30100_available_samples(void)
+{
+    uint8_t wr = 0;
+    uint8_t rd = 0;
+
+    max30100_read_reg(REG_FIFO_WR_PTR, &wr);
+    max30100_read_reg(REG_FIFO_RD_PTR, &rd);
+
+    wr &= 0x0F;
+    rd &= 0x0F;
+
+    if (wr >= rd)
+    {
+        return wr - rd;
+    }
+
+    return 16 + wr - rd;
+}
+
+static bool max30100_read_fifo(uint16_t *ir, uint16_t *red)
+{
+    uint8_t reg = REG_FIFO_DATA;
+    uint8_t raw[4];
+
+    if (!TWI0_WriteRead(MAX30100_ADDR, &reg, 1, raw, 4))
+    {
+        return false;
+    }
+
+    while (TWI0_IsBusy());
+
+    *ir  = ((uint16_t)raw[0] << 8) | raw[1];
+    *red = ((uint16_t)raw[2] << 8) | raw[3];
+
+    return true;
+}
+
+/*
+ * Utility
+ */
+static int16_t clamp_i32_to_i16(int32_t x)
+{
+    if (x > 32767L)
+    {
+        return 32767;
+    }
+
+    if (x < -32768L)
+    {
+        return -32768;
+    }
+
+    return (int16_t)x;
+}
+
+/*
+ * Filters
+ */
+static void DCRemover_Init(DCRemoverQ15 *f)
+{
+    f->dcw = 0;
+    f->initialized = false;
+}
+
+static int32_t DCRemover_Step(DCRemoverQ15 *f, uint16_t raw)
+{
+    int32_t old;
+
+    /*
+     * Avoid startup false pulse.
+     *
+     * Original formula:
+     * dcw = raw + 0.95 * dcw
+     *
+     * For constant input:
+     * dcw = raw / (1 - 0.95) = raw * 20
+     */
+    if (!f->initialized)
+    {
+        f->dcw = (int32_t)raw * 20L;
+        f->initialized = true;
+        return 0;
+    }
+
+    old = f->dcw;
+
+    f->dcw = (int32_t)raw + Q15_MUL(DC_ALPHA_Q15, f->dcw);
+
+    return f->dcw - old;
+}
+
+static void LowPass_Init(LowPassQ15 *f)
+{
+    f->v0 = 0;
+    f->v1 = 0;
+}
+
+static int32_t LowPass_Step(LowPassQ15 *f, int32_t x)
+{
+    /*
+     * Fixed-point translation of original Arduino library filter.
+     */
+    f->v0 = f->v1;
+
+    f->v1 = Q15_MUL(LPF_B0_Q15, x)
+          + Q15_MUL(LPF_A1_Q15, f->v0);
+
+    return f->v0 + f->v1;
+}
+
+static void Filters_Reset(void)
+{
+    DCRemover_Init(&ir_dc);
+    LowPass_Init(&lpf);
+}
+
+/*
+ * Beat detector
+ */
 static void BeatDetector_Reset(void)
 {
     beatState = BEAT_INIT;
@@ -75,41 +348,36 @@ static void BeatDetector_Reset(void)
     lastBeatMs = 0;
     beatPeriod = 0;
     bpm = 0;
-    dcw = 0;
-    lpf_prev = 0;
-}
 
-static int16_t DCRemove(uint16_t raw)
-{
-    int32_t old = dcw;
+    Filters_Reset();
 
-    // Approximation of alpha = 0.95 from the Arduino source
-    dcw = (int32_t)raw + ((dcw * 95L) / 100L);
-
-    return (int16_t)(dcw - old);
-}
-
-static int16_t LowPass(int16_t x)
-{
-    lpf_prev = lpf_prev + ((x - lpf_prev) / 4);
-    return lpf_prev;
+    beatRecentlyDetected = false;
+    lastBeatDisplayMs = 0;
 }
 
 static void decreaseThreshold(void)
 {
     if (lastMaxValue > 0 && beatPeriod > 0)
     {
-        uint32_t div = beatPeriod / 10UL;
+        uint32_t div = beatPeriod / LOOP_DELAY_MS;
+
         if (div == 0)
         {
             div = 1;
         }
 
-        threshold -= (int16_t)(((int32_t)lastMaxValue * 7L) / (int32_t)div);
+        /*
+         * Original idea:
+         * threshold -= lastMaxValue * 0.7 / samples_per_beat
+         */
+        threshold -= (int16_t)(((int32_t)lastMaxValue * 7L) / ((int32_t)div * 10L));
     }
     else
     {
-        threshold = (threshold * 99) / 100;
+        /*
+         * threshold *= 0.99
+         */
+        threshold = (int16_t)(((int32_t)threshold * 99L) / 100L);
     }
 
     if (threshold < BEAT_MIN_THRESHOLD)
@@ -193,17 +461,20 @@ static bool BeatDetector_Update(int16_t sample, uint32_t nowMs)
                             / BEAT_PERIOD_ALPHA_DEN;
                     }
 
-                    uint16_t newBpm = (uint16_t)(60000UL / beatPeriod);
+                    if (beatPeriod > 0)
+                    {
+                        uint16_t newBpm = (uint16_t)(60000UL / beatPeriod);
 
-                    if (bpm == 0)
-                    {
-                        bpm = newBpm;
+                        if (bpm == 0)
+                        {
+                            bpm = newBpm;
+                        }
+                        else
+                        {
+                            bpm = (uint16_t)((bpm * 7U + newBpm) / 8U);
+                        }
                     }
-                    else
-                    {
-                        bpm = (bpm * 7 + newBpm) / 8;
-                    }
-                                }
+                }
 
                 lastBeatMs = nowMs;
             }
@@ -221,42 +492,210 @@ static bool BeatDetector_Update(int16_t sample, uint32_t nowMs)
 
             decreaseThreshold();
             break;
+
+        default:
+            BeatDetector_Reset();
+            break;
     }
 
     return beatDetected;
 }
 
+
+static void logFinalSignalToDataStream(int16_t value)
+{
+    USART2_Write(0x03);
+
+    /*
+     * Send signed 16-bit value, big-endian:
+     * high byte first, low byte second.
+     */
+    USART2_Write((uint8_t)((value >> 8) & 0xFF));
+    USART2_Write((uint8_t)(value & 0xFF));
+
+    USART2_Write(0xFC);
+}
+
+
+/*
+ * Process one MAX30100 sample
+ */
+static void process_sample(uint16_t ir, uint16_t red, uint32_t timeMs)
+{
+    int32_t irAC;
+    int32_t filteredPulse32;
+    int16_t filteredPulse16;
+    bool beatDetected;
+
+    /*
+     * No finger.
+     *
+     * Reset and flush only when the state changes.
+     * Do not reset 100 times per second while the finger is absent.
+     */
+    if (ir < RAW_MIN_FINGER_LIMIT || red < RAW_MIN_FINGER_LIMIT)
+    {
+        fingerPresent = false;
+        saturated = false;
+
+        if (lastFingerPresent || lastSaturated)
+        {
+            BeatDetector_Reset();
+            max30100_reset_fifo();
+        }
+
+        lastFingerPresent = false;
+        lastSaturated = false;
+        return;
+    }
+
+    /*
+     * Saturated signal.
+     *
+     * This usually means LED current is too high or the sensor is flooded.
+     * Flush only once when entering saturation.
+     */
+    if (ir > RAW_SATURATION_LIMIT || red > RAW_SATURATION_LIMIT)
+    {
+        fingerPresent = true;
+        saturated = true;
+
+        if (!lastSaturated)
+        {
+            BeatDetector_Reset();
+            max30100_reset_fifo();
+        }
+
+        lastFingerPresent = true;
+        lastSaturated = true;
+        return;
+    }
+
+    /*
+     * Valid finger signal just appeared.
+     *
+     * Start clean and ignore this first sample after the transition,
+     * so stale FIFO/filter history cannot affect the first BPM estimate.
+     */
+    fingerPresent = true;
+    saturated = false;
+
+    if (!lastFingerPresent || lastSaturated)
+    {
+        BeatDetector_Reset();
+        max30100_reset_fifo();
+
+        lastFingerPresent = true;
+        lastSaturated = false;
+        return;
+    }
+
+    lastFingerPresent = true;
+    lastSaturated = false;
+
+    /*
+     * Processing chain from Arduino MAX30100 library:
+     *
+     * irACValue          = irDCRemover.step(rawIRValue)
+     * filteredPulseValue = lpf.step(-irACValue)
+     * beatDetected       = beatDetector.addSample(filteredPulseValue)
+     */
+    irAC = DCRemover_Step(&ir_dc, ir);
+
+    /*
+     * Debug option:
+     * Plot DC-removed pulse before low-pass.
+     *
+     * Enable this if you want to see irAC in Data Visualizer.
+     */
+#if 0
+    if (USART2_IsTxReady())
+    {
+        logInt16ToDataStream(clamp_i32_to_i16(irAC));
+    }
+#endif
+
+    filteredPulse32 = LowPass_Step(&lpf, -irAC);
+    filteredPulse16 = clamp_i32_to_i16(filteredPulse32);
+
+    if (USART2_IsTxReady())
+    {
+        logFinalSignalToDataStream(filteredPulse16);
+    }
+
+    beatDetected = BeatDetector_Update(filteredPulse16, timeMs);
+
+    if (beatDetected)
+    {
+        beatRecentlyDetected = true;
+        lastBeatDisplayMs = timeMs;
+    }
+
+    if ((timeMs - lastBeatDisplayMs) > 250UL)
+    {
+        beatRecentlyDetected = false;
+    }
+}
+
+
+
+
 int main(void)
 {
-    SYSTEM_Initialize();
-    LCD_Initialize();
-
-    uint8_t d[2];
-    uint8_t reg;
-    uint8_t raw[4];
-
+    uint8_t samples;
+    uint8_t ovf;
     uint16_t ir;
     uint16_t red;
-
-    int16_t irAC;
-    int16_t filteredPulse;
 
     uint32_t timeMs = 0;
     uint32_t lastLcdMs = 0;
 
     char line[17];
 
+    SYSTEM_Initialize();
+    LCD_Initialize();
+
     _delay_ms(500);
 
-    d[0] = 0x09;
-    d[1] = 0xFF;
-    TWI0_Write(MAX30100_ADDR, d, 2);
-    while (TWI0_IsBusy());
+    BeatDetector_Reset();
 
-    d[0] = 0x06;
-    d[1] = 0x03;
-    TWI0_Write(MAX30100_ADDR, d, 2);
-    while (TWI0_IsBusy());
+    /*
+     * MAX30100 setup
+     */
+
+    /*
+     * LED current.
+     *
+     * Register 0x09:
+     * high nibble = RED current
+     * low nibble  = IR current
+     *
+     * Try:
+     * 0x66 = 20.8 mA / 20.8 mA
+     * 0x88 = 27.1 mA / 27.1 mA
+     * 0xAA = 33.8 mA / 33.8 mA
+     */
+    max30100_write_reg(REG_LED_CONFIG, 0x88);
+
+    /*
+     * SpO2 + heart-rate mode.
+     */
+    max30100_write_reg(REG_MODE_CONFIG, MODE_SPO2);
+
+    /*
+     * SpO2 config:
+     *
+     * 0x47:
+     * bit 6    = high-resolution enabled
+     * bits 4:2 = 100 Hz
+     * bits 1:0 = 1600 us / 16-bit
+     */
+    max30100_write_reg(REG_SPO2_CONFIG, 0x47);
+
+    /*
+     * Important: reset FIFO after configuration.
+     */
+    max30100_reset_fifo();
 
     LCDGoto(0, 0);
     LCDPutStr("Place finger    ");
@@ -265,63 +704,124 @@ int main(void)
 
     while (1)
     {
-        reg = 0x05;
+        /*
+         * Check FIFO overflow first.
+         *
+         * If the overflow counter is non-zero, samples were lost.
+         * Beat timing is then unreliable, so reset detector and FIFO.
+         */
+        ovf = max30100_get_overflow_count();
 
-        TWI0_WriteRead(MAX30100_ADDR, &reg, 1, raw, 4);
-        while (TWI0_IsBusy());
-
-        ir  = ((uint16_t)raw[0] << 8) | raw[1];
-        red = ((uint16_t)raw[2] << 8) | raw[3];
-
-        if (ir < 10000 || red < 10000)
+        if (ovf > 0)
         {
             BeatDetector_Reset();
+            max30100_reset_fifo();
 
-            if ((timeMs - lastLcdMs) >= LCD_UPDATE_MS)
+            fingerPresent = false;
+            saturated = false;
+            lastFingerPresent = false;
+            lastSaturated = false;
+
+            /*
+             * Keep software time aligned to the clean restart.
+             */
+            timeMs = 0;
+            lastLcdMs = 0;
+
+            _delay_ms(1);
+            continue;
+        }
+
+        /*
+         * Check how many samples are waiting in FIFO.
+         */
+        samples = max30100_available_samples();
+
+        /*
+         * If FIFO is almost full, the samples are probably stale.
+         * Flush instead of calculating BPM from delayed data.
+         */
+        if (samples >= FIFO_NEAR_FULL_LIMIT)
+        {
+            BeatDetector_Reset();
+            max30100_reset_fifo();
+
+            fingerPresent = false;
+            saturated = false;
+            lastFingerPresent = false;
+            lastSaturated = false;
+
+            timeMs = 0;
+            lastLcdMs = 0;
+
+            _delay_ms(1);
+            continue;
+        }
+
+        while (samples > 0)
+        {
+            if (max30100_read_fifo(&ir, &red))
             {
-                lastLcdMs = timeMs;
+                process_sample(ir, red, timeMs);
 
-                LCDGoto(0, 0);
+                /*
+                 * Sensor is configured for 100 Hz.
+                 * Therefore each FIFO sample represents 10 ms.
+                 */
+                timeMs += LOOP_DELAY_MS;
+            }
+
+            samples--;
+        }
+
+        /*
+         * LCD update
+         */
+        if ((timeMs - lastLcdMs) >= LCD_UPDATE_MS)
+        {
+            lastLcdMs = timeMs;
+
+            LCDGoto(0, 0);
+
+            if (!fingerPresent)
+            {
                 LCDPutStr("No finger       ");
-                LCDGoto(0, 1);
+            }
+            else if (saturated)
+            {
+                LCDPutStr("Too bright      ");
+            }
+            else if (beatRecentlyDetected)
+            {
+                LCDPutStr("Finger: beat *  ");
+            }
+            else
+            {
+                LCDPutStr("Finger detected ");
+            }
+
+            LCDGoto(0, 1);
+
+            if (saturated)
+            {
+                LCDPutStr("Lower LED curr  ");
+            }
+            else if (bpm == 0)
+            {
                 LCDPutStr("BPM: --         ");
             }
-        }
-        else
-        {
-            irAC = DCRemove(ir);
-
-            // Arduino source mirrors the IR AC signal before beat detection
-            filteredPulse = LowPass(-irAC);
-
-            BeatDetector_Update(filteredPulse, timeMs);
-
-            if ((timeMs - lastLcdMs) >= LCD_UPDATE_MS)
+            else
             {
-                lastLcdMs = timeMs;
-
-                LCDGoto(0, 0);
-                LCDPutStr("Finger detected ");
-
-                LCDGoto(0, 1);
-                if (bpm == 0)
-                {
-                    LCDPutStr("BPM: --         ");
-                }
-                else
-                {
-                    sprintf(line, "BPM:%3u         ", bpm);
-                    LCDPutStr(line);
-                }
+                sprintf(line, "BPM:%3u         ", bpm);
+                LCDPutStr(line);
             }
         }
 
-        if (USART2_IsTxReady())
-        {
-            logToDataStream(raw);
-        }
-
-        _delay_ms(LOOP_DELAY_MS);
-        timeMs += LOOP_DELAY_MS;
+        /*
+         * Do not sleep 10 ms here.
+         * The MAX30100 already produces one sample every 10 ms.
+         * Keep this small so FIFO cannot build up.
+         */
+        _delay_ms(1);
     }
 }
