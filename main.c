@@ -91,6 +91,9 @@
 #define LPF_B0_Q15                 8036L
 #define LPF_A1_Q15                 16696L
 
+#define SENSOR_WARMUP_MS           10000UL
+#define FIFO_NEAR_FULL_LIMIT       15U
+
 #define Q15_MUL(a, b) ((int32_t)(((int64_t)(a) * (int64_t)(b)) >> Q15_SHIFT))
 
 typedef enum {
@@ -127,6 +130,7 @@ static uint16_t bpm = 0;
  */
 static DCRemoverQ15 ir_dc;
 static LowPassQ15 lpf;
+static LowPassQ15 lpf2;
 
 /*
  * Last status for LCD.
@@ -136,12 +140,19 @@ static bool saturated = false;
 static bool beatRecentlyDetected = false;
 static uint32_t lastBeatDisplayMs = 0;
 
+
 /*
  * State-change tracking.
  * These prevent resetting the filters/beat detector on every bad sample.
  */
 static bool lastFingerPresent = false;
 static bool lastSaturated = false;
+
+static bool measurementReady = false;
+static uint32_t fingerPlacedMs = 0;
+
+
+
 
 /*
  * Optional raw logging.
@@ -209,17 +220,6 @@ static void max30100_reset_fifo(void)
     max30100_write_reg(REG_FIFO_RD_PTR, 0x00);
 }
 
-static uint8_t max30100_get_overflow_count(void)
-{
-    uint8_t ovf = 0;
-
-    if (!max30100_read_reg(REG_OVF_COUNTER, &ovf))
-    {
-        return 0;
-    }
-
-    return ovf & 0x0F;
-}
 
 static uint8_t max30100_available_samples(void)
 {
@@ -334,7 +334,8 @@ static int32_t LowPass_Step(LowPassQ15 *f, int32_t x)
 static void Filters_Reset(void)
 {
     DCRemover_Init(&ir_dc);
-    LowPass_Init(&lpf);
+    LowPass_Init(&lpf);    
+    LowPass_Init(&lpf2);
 }
 
 /*
@@ -516,6 +517,115 @@ static void logFinalSignalToDataStream(int16_t value)
     USART2_Write(0xFC);
 }
 
+static uint8_t max30100_get_overflow_count(void)
+{
+    uint8_t ovf = 0;
+
+    if (!max30100_read_reg(REG_OVF_COUNTER, &ovf))
+    {
+        return 0;
+    }
+
+    return ovf & 0x0F;
+}
+
+
+
+#define LED_GREEN_PIN   PIN0_bm   // PA0
+
+#define LED_YELLOW_PIN  PIN1_bm   // PA1
+
+#define LED_RED_PIN     PIN1_bm   // PC1
+
+typedef enum {
+
+    PULSE_STATE_GREEN = 0,
+
+    PULSE_STATE_YELLOW,
+
+    PULSE_STATE_RED
+
+} PulseState_t;
+
+void PulseAmpel_Init(void)
+
+{
+
+    // PA0 und PA1 als Ausgang
+
+    PORTA.DIRSET = LED_GREEN_PIN | LED_YELLOW_PIN;
+
+    // PC1 als Ausgang
+
+    PORTC.DIRSET = LED_RED_PIN;
+
+    // alle LEDs aus
+
+    PORTA.OUTCLR = LED_GREEN_PIN | LED_YELLOW_PIN;
+
+    PORTC.OUTCLR = LED_RED_PIN;
+
+}
+
+static PulseState_t PulseAmpel_GetState(uint16_t bpm)
+
+{
+
+    if (bpm >= 60 && bpm <= 90) {
+
+        return PULSE_STATE_GREEN;
+
+    }
+
+    if ((bpm >= 50 && bpm < 60) || (bpm > 90 && bpm <= 120)) {
+
+        return PULSE_STATE_YELLOW;
+
+    }
+
+    return PULSE_STATE_RED;
+
+}
+
+void PulseAmpel_Update(uint16_t bpm)
+
+{
+
+    PulseState_t state = PulseAmpel_GetState(bpm);
+
+    // erst alle LEDs aus
+
+    PORTA.OUTCLR = LED_GREEN_PIN | LED_YELLOW_PIN;
+
+    PORTC.OUTCLR = LED_RED_PIN;
+
+    switch (state)
+
+    {
+
+        case PULSE_STATE_GREEN:
+
+            PORTA.OUTSET = LED_GREEN_PIN;      // grün an
+
+            break;
+
+        case PULSE_STATE_YELLOW:
+
+            PORTA.OUTSET = LED_YELLOW_PIN;     // gelb an
+
+            break;
+
+        case PULSE_STATE_RED:
+
+        default:
+
+            PORTC.OUTSET = LED_RED_PIN;        // rot an
+
+            break;
+
+    }
+
+}
 
 /*
  * Process one MAX30100 sample
@@ -529,14 +639,13 @@ static void process_sample(uint16_t ir, uint16_t red, uint32_t timeMs)
 
     /*
      * No finger.
-     *
-     * Reset and flush only when the state changes.
-     * Do not reset 100 times per second while the finger is absent.
+     * Clear averages only once when we transition from finger-present to no-finger.
      */
     if (ir < RAW_MIN_FINGER_LIMIT || red < RAW_MIN_FINGER_LIMIT)
     {
         fingerPresent = false;
         saturated = false;
+        measurementReady = false;
 
         if (lastFingerPresent || lastSaturated)
         {
@@ -550,15 +659,14 @@ static void process_sample(uint16_t ir, uint16_t red, uint32_t timeMs)
     }
 
     /*
-     * Saturated signal.
-     *
-     * This usually means LED current is too high or the sensor is flooded.
-     * Flush only once when entering saturation.
+     * Sensor saturated / too bright.
+     * Also reset only once when entering saturated state.
      */
     if (ir > RAW_SATURATION_LIMIT || red > RAW_SATURATION_LIMIT)
     {
         fingerPresent = true;
         saturated = true;
+        measurementReady = false;
 
         if (!lastSaturated)
         {
@@ -572,53 +680,53 @@ static void process_sample(uint16_t ir, uint16_t red, uint32_t timeMs)
     }
 
     /*
-     * Valid finger signal just appeared.
-     *
-     * Start clean and ignore this first sample after the transition,
-     * so stale FIFO/filter history cannot affect the first BPM estimate.
+     * Valid finger signal.
      */
     fingerPresent = true;
     saturated = false;
 
+    /*
+     * Finger just became valid.
+     * Start clean, flush old FIFO data, and start 10-second warmup.
+     */
     if (!lastFingerPresent || lastSaturated)
     {
         BeatDetector_Reset();
         max30100_reset_fifo();
 
+        fingerPlacedMs = timeMs;
+        measurementReady = false;
+
         lastFingerPresent = true;
         lastSaturated = false;
+
         return;
+    }
+
+    /*
+     * During warmup, keep processing samples so the DC remover, low-pass filters,
+     * threshold, and beat period can settle, but do not show BPM yet.
+     */
+    if ((timeMs - fingerPlacedMs) >= SENSOR_WARMUP_MS)
+    {
+        measurementReady = true;
     }
 
     lastFingerPresent = true;
     lastSaturated = false;
 
-    /*
-     * Processing chain from Arduino MAX30100 library:
-     *
-     * irACValue          = irDCRemover.step(rawIRValue)
-     * filteredPulseValue = lpf.step(-irACValue)
-     * beatDetected       = beatDetector.addSample(filteredPulseValue)
-     */
     irAC = DCRemover_Step(&ir_dc, ir);
 
-    /*
-     * Debug option:
-     * Plot DC-removed pulse before low-pass.
-     *
-     * Enable this if you want to see irAC in Data Visualizer.
-     */
-#if 0
-    if (USART2_IsTxReady())
-    {
-        logInt16ToDataStream(clamp_i32_to_i16(irAC));
-    }
-#endif
-
     filteredPulse32 = LowPass_Step(&lpf, -irAC);
+    filteredPulse32 = LowPass_Step(&lpf2, filteredPulse32);
+
     filteredPulse16 = clamp_i32_to_i16(filteredPulse32);
 
-    if (USART2_IsTxReady())
+    /*
+     * Optional: only log final signal after warmup.
+     * This avoids plotting startup settling as if it were real.
+     */
+    if (measurementReady && USART2_IsTxReady())
     {
         logFinalSignalToDataStream(filteredPulse16);
     }
@@ -639,7 +747,6 @@ static void process_sample(uint16_t ir, uint16_t red, uint32_t timeMs)
 
 
 
-
 int main(void)
 {
     uint8_t samples;
@@ -654,6 +761,7 @@ int main(void)
 
     SYSTEM_Initialize();
     LCD_Initialize();
+    PulseAmpel_Init();
 
     _delay_ms(500);
 
@@ -675,7 +783,7 @@ int main(void)
      * 0x88 = 27.1 mA / 27.1 mA
      * 0xAA = 33.8 mA / 33.8 mA
      */
-    max30100_write_reg(REG_LED_CONFIG, 0x88);
+    max30100_write_reg(REG_LED_CONFIG, 0x77);
 
     /*
      * SpO2 + heart-rate mode.
@@ -703,125 +811,110 @@ int main(void)
     LCDPutStr("BPM: --         ");
 
     while (1)
+{
+    uint8_t ovf;
+
+    ovf = max30100_get_overflow_count();
+
+    if (ovf > 0)
     {
-        /*
-         * Check FIFO overflow first.
-         *
-         * If the overflow counter is non-zero, samples were lost.
-         * Beat timing is then unreliable, so reset detector and FIFO.
-         */
-        ovf = max30100_get_overflow_count();
+        BeatDetector_Reset();
+        max30100_reset_fifo();
 
-        if (ovf > 0)
-        {
-            BeatDetector_Reset();
-            max30100_reset_fifo();
+        measurementReady = false;
+        lastFingerPresent = false;
+        lastSaturated = false;
 
-            fingerPresent = false;
-            saturated = false;
-            lastFingerPresent = false;
-            lastSaturated = false;
-
-            /*
-             * Keep software time aligned to the clean restart.
-             */
-            timeMs = 0;
-            lastLcdMs = 0;
-
-            _delay_ms(1);
-            continue;
-        }
-
-        /*
-         * Check how many samples are waiting in FIFO.
-         */
-        samples = max30100_available_samples();
-
-        /*
-         * If FIFO is almost full, the samples are probably stale.
-         * Flush instead of calculating BPM from delayed data.
-         */
-        if (samples >= FIFO_NEAR_FULL_LIMIT)
-        {
-            BeatDetector_Reset();
-            max30100_reset_fifo();
-
-            fingerPresent = false;
-            saturated = false;
-            lastFingerPresent = false;
-            lastSaturated = false;
-
-            timeMs = 0;
-            lastLcdMs = 0;
-
-            _delay_ms(1);
-            continue;
-        }
-
-        while (samples > 0)
-        {
-            if (max30100_read_fifo(&ir, &red))
-            {
-                process_sample(ir, red, timeMs);
-
-                /*
-                 * Sensor is configured for 100 Hz.
-                 * Therefore each FIFO sample represents 10 ms.
-                 */
-                timeMs += LOOP_DELAY_MS;
-            }
-
-            samples--;
-        }
-
-        /*
-         * LCD update
-         */
-        if ((timeMs - lastLcdMs) >= LCD_UPDATE_MS)
-        {
-            lastLcdMs = timeMs;
-
-            LCDGoto(0, 0);
-
-            if (!fingerPresent)
-            {
-                LCDPutStr("No finger       ");
-            }
-            else if (saturated)
-            {
-                LCDPutStr("Too bright      ");
-            }
-            else if (beatRecentlyDetected)
-            {
-                LCDPutStr("Finger: beat *  ");
-            }
-            else
-            {
-                LCDPutStr("Finger detected ");
-            }
-
-            LCDGoto(0, 1);
-
-            if (saturated)
-            {
-                LCDPutStr("Lower LED curr  ");
-            }
-            else if (bpm == 0)
-            {
-                LCDPutStr("BPM: --         ");
-            }
-            else
-            {
-                sprintf(line, "BPM:%3u         ", bpm);
-                LCDPutStr(line);
-            }
-        }
-
-        /*
-         * Do not sleep 10 ms here.
-         * The MAX30100 already produces one sample every 10 ms.
-         * Keep this small so FIFO cannot build up.
-         */
-        _delay_ms(1);
+        continue;
     }
+
+    samples = max30100_available_samples();
+
+    if (samples >= FIFO_NEAR_FULL_LIMIT)
+    {
+        BeatDetector_Reset();
+        max30100_reset_fifo();
+
+        measurementReady = false;
+        lastFingerPresent = false;
+        lastSaturated = false;
+
+        continue;
+    }
+    PulseAmpel_Update(bpm); 
+
+    while (samples > 0)
+    {
+        if (max30100_read_fifo(&ir, &red))
+        {
+            process_sample(ir, red, timeMs);
+            timeMs += LOOP_DELAY_MS;
+        }
+
+        samples--;
+    }
+
+    if ((timeMs - lastLcdMs) >= LCD_UPDATE_MS)
+    {
+        lastLcdMs = timeMs;
+
+        LCDGoto(0, 0);
+
+        if (!fingerPresent)
+        {
+            LCDPutStr("No finger       ");
+        }
+        else if (saturated)
+        {
+            LCDPutStr("Too bright      ");
+        }
+        else if (!measurementReady)
+        {
+            LCDPutStr("Stabilizing...  ");
+        }
+        else if (beatRecentlyDetected)
+        {
+            LCDPutStr("Finger: beat *  ");
+        }
+        else
+        {
+            LCDPutStr("Finger detected ");
+        }
+
+        LCDGoto(0, 1);
+
+        if (saturated)
+        {
+            LCDPutStr("Lower LED curr  ");
+        }
+        else if (!fingerPresent)
+        {
+            LCDPutStr("BPM: --         ");
+        }
+        else if (!measurementReady)
+        {
+            uint16_t remaining;
+
+            remaining = (uint16_t)((SENSOR_WARMUP_MS - (timeMs - fingerPlacedMs)) / 1000UL);
+
+            sprintf(line, "Wait:%2us        ", remaining);
+            LCDPutStr(line);
+        }
+        else if (bpm == 0)
+        {
+            LCDPutStr("BPM: --         ");
+        }
+        else
+        {
+            sprintf(line, "BPM:%3u         ", bpm);
+            LCDPutStr(line);
+        }
+    }
+
+    /*
+     * Do not sleep 10 ms here. The sensor itself produces samples at 100 Hz.
+     * This delay is only to avoid hammering I2C constantly.
+     */
+    _delay_ms(1);
+}
 }
