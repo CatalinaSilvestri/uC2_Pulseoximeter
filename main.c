@@ -130,8 +130,14 @@ static uint16_t bpm = 0;
  * Filter state.
  */
 static DCRemoverQ15 ir_dc;
+static DCRemoverQ15 red_dc;
 static LowPassQ15 lpf;
 static LowPassQ15 lpf2;
+
+// SPO2 detection
+
+static Spo2Detector_t spo2Detector;
+static uint8_t spo2 = 0;
 
 /*
  * Last status for LCD.
@@ -335,6 +341,7 @@ static int32_t LowPass_Step(LowPassQ15 *f, int32_t x)
 static void Filters_Reset(void)
 {
     DCRemover_Init(&ir_dc);
+    DCRemover_Init(&red_dc);
     LowPass_Init(&lpf);    
     //LowPass_Init(&lpf2);
 }
@@ -352,6 +359,9 @@ static void BeatDetector_Reset(void)
     bpm = 0;
 
     Filters_Reset();
+
+    spo2_reset(&spo2Detector);
+    spo2 = 0;
 
     beatRecentlyDetected = false;
     lastBeatDisplayMs = 0;
@@ -606,7 +616,7 @@ void PulseAmpel_Update(uint16_t bpm)
 
         case PULSE_STATE_GREEN:
 
-            PORTA.OUTSET = LED_GREEN_PIN;      // grün an
+            PORTA.OUTSET = LED_GREEN_PIN;      // gr?n an
 
             break;
 
@@ -634,6 +644,7 @@ void PulseAmpel_Update(uint16_t bpm)
 static void process_sample(uint16_t ir, uint16_t red, uint32_t timeMs)
 {
     int32_t irAC;
+    int32_t redAC;
     int32_t filteredPulse32;
     int16_t filteredPulse16;
     bool beatDetected;
@@ -717,6 +728,7 @@ static void process_sample(uint16_t ir, uint16_t red, uint32_t timeMs)
     lastSaturated = false;
 
     irAC = DCRemover_Step(&ir_dc, ir);
+    redAC = DCRemover_Step(&red_dc, red);
 
     filteredPulse32 = LowPass_Step(&lpf, -irAC);
     filteredPulse32 = LowPass_Step(&lpf2, filteredPulse32);
@@ -733,6 +745,12 @@ static void process_sample(uint16_t ir, uint16_t red, uint32_t timeMs)
     }
 
     beatDetected = BeatDetector_Update(filteredPulse16, timeMs);
+    
+    if (measurementReady && bpm > 0)
+    {
+    spo2_update(&spo2Detector, irAC, redAC, ir, red, beatDetected);
+    spo2 = spo2_get(&spo2Detector);
+    }
 
     if (beatDetected)
     {
@@ -767,6 +785,7 @@ int main(void)
     _delay_ms(500);
 
     BeatDetector_Reset();
+    spo2_init(&spo2Detector);
 
     /*
      * MAX30100 setup
@@ -784,7 +803,7 @@ int main(void)
      * 0x88 = 27.1 mA / 27.1 mA
      * 0xAA = 33.8 mA / 33.8 mA
      */
-    max30100_write_reg(REG_LED_CONFIG, 0x66);
+    max30100_write_reg(REG_LED_CONFIG, 0x66); // changed manually
 
     /*
      * SpO2 + heart-rate mode.
@@ -907,7 +926,15 @@ int main(void)
         }
         else
         {
-            sprintf(line, "BPM:%3u         ", bpm);
+            if (spo2_is_valid(&spo2Detector))
+            {
+                sprintf(line, "B:%3u O2:%3u%%  ", bpm, spo2);
+            }
+            else
+            {
+                sprintf(line, "B:%3u O2:--%%   ", bpm);
+            }
+
             LCDPutStr(line);
         }
     }
