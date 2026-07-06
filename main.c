@@ -9,6 +9,7 @@
 #include "lcd.h"
 #include "LcdUtils.h"
 #include "beat_detector_c.h"
+#include "spo2_detector.h"
 
 /*
  * MAX30100 registers
@@ -335,7 +336,7 @@ static void Filters_Reset(void)
 {
     DCRemover_Init(&ir_dc);
     LowPass_Init(&lpf);    
-    LowPass_Init(&lpf2);
+    //LowPass_Init(&lpf2);
 }
 
 /*
@@ -783,7 +784,7 @@ int main(void)
      * 0x88 = 27.1 mA / 27.1 mA
      * 0xAA = 33.8 mA / 33.8 mA
      */
-    max30100_write_reg(REG_LED_CONFIG, 0x77);
+    max30100_write_reg(REG_LED_CONFIG, 0x66);
 
     /*
      * SpO2 + heart-rate mode.
