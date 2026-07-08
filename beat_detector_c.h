@@ -52,6 +52,14 @@ typedef enum BeatDetectorState {
     BEATDETECTOR_STATE_MASKING
 } BeatDetectorState;
 
+typedef enum {
+    BEAT_INIT,
+    BEAT_WAITING,
+    BEAT_FOLLOWING_SLOPE,
+    BEAT_MAYBE_DETECTED,
+    BEAT_MASKING
+} BeatState;
+
 typedef struct {
     int32_t v[2];
 } FilterBuLp1;
@@ -70,18 +78,6 @@ typedef struct {
     uint32_t tsLastBeat;
 } BeatDetector;
 
-/*
- * FilterBuLp1
- */
-void FilterBuLp1_init(FilterBuLp1* f);
-int32_t FilterBuLp1_step(FilterBuLp1* f, int32_t x);
-
-/*
- * DCRemover
- */
-void DCRemover_init(DCRemover* d, int32_t alpha_q15);
-int32_t DCRemover_step(DCRemover* d, uint16_t x);
-int32_t DCRemover_getDCW(const DCRemover* d);
 
 /*
  * BeatDetector
